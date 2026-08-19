@@ -18,6 +18,8 @@ assert_contains() {
 assert_contains 'PasswordAuthentication yes'
 assert_contains 'PermitRootLogin yes'
 assert_contains '/swapfile none swap sw 0 0'
+assert_contains '1|2|4)'
+assert_contains 'configure_swap 1'
 assert_contains 'OnCalendar=*-*-*'
 assert_contains 'IP_MODE="prefer6"'
 assert_contains 'table inet setvps_family'

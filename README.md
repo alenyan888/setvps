@@ -5,7 +5,7 @@
 ## 功能
 
 - 开启 Root SSH 密码登录，并生成一次性显示的 14 位随机密码。
-- 创建 2G 或 4G `/swapfile`，自动启用、验证并写入 `/etc/fstab`。
+- 创建 1G、2G 或 4G `/swapfile`，自动启用、验证并写入 `/etc/fstab`。
 - 按服务器本机时区设置多个每日重启时间，支持单独或全部删除。
 - 检测本机和公网 IPv4/IPv6。
 - 设置“仅公网 IPv4”“仅公网 IPv6”“IPv4 优先后 IPv6”“IPv6 优先后 IPv4”。
@@ -34,7 +34,7 @@ sudo setvps
 ```text
 setvps                 打开交互式菜单
 setvps ssh             设置 Root SSH 密码登录
-setvps swap 2|4        创建 2G 或 4G Swap
+setvps swap 1|2|4      创建 1G、2G 或 4G Swap
 setvps reboot          管理每日重启时间
 setvps ip              管理 IP 出站策略
 setvps status          查看状态
