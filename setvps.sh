@@ -238,7 +238,9 @@ configure_swap() {
   truncate -s 0 /swapfile
   if findmnt -no FSTYPE / 2>/dev/null | grep -qx 'btrfs'; then
     chattr +C /swapfile 2>/dev/null || true
-    command -v btrfs >/dev/null 2>&1 && btrfs property set /swapfile compression none 2>/dev/null || true
+    if command -v btrfs >/dev/null 2>&1; then
+      btrfs property set /swapfile compression none 2>/dev/null || true
+    fi
   fi
   if command -v fallocate >/dev/null 2>&1 && fallocate -l "${size_gib}G" /swapfile; then
     :
