@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 INSTALL_PATH="/usr/local/sbin/setvps"
 COMMAND_LINK="/usr/local/bin/setvps"
 STATE_DIR="/etc/setvps"
@@ -225,7 +225,10 @@ EOF
 
 configure_swap() {
   local size_gib="$1"
-  [[ "${size_gib}" == "2" || "${size_gib}" == "4" ]] || die "Swap 仅支持 2G 或 4G。"
+  case "${size_gib}" in
+    1|2|4) ;;
+    *) die "Swap 仅支持 1G、2G 或 4G。" ;;
+  esac
   ensure_package mkswap util-linux
   install -d -m 0700 "${STATE_DIR}" "${BACKUP_DIR}"
 
@@ -275,15 +278,17 @@ configure_swap() {
 
 swap_menu() {
   printf '\n%s\n' "${C_BOLD}选择 Swap 大小${C_RESET}"
-  printf '  1) 2G（默认）\n'
-  printf '  2) 4G\n'
+  printf '  1) 1G\n'
+  printf '  2) 2G（默认）\n'
+  printf '  3) 4G\n'
   printf '  0) 返回\n'
   local choice
-  read -r -p '请选择 [1]: ' choice
-  choice="${choice:-1}"
+  read -r -p '请选择 [2]: ' choice
+  choice="${choice:-2}"
   case "${choice}" in
-    1) configure_swap 2 ;;
-    2) configure_swap 4 ;;
+    1) configure_swap 1 ;;
+    2) configure_swap 2 ;;
+    3) configure_swap 4 ;;
     0) return ;;
     *) warn "无效选项。" ;;
   esac
@@ -823,7 +828,7 @@ main_menu() {
   while true; do
     printf '\n%s\n' "${C_BOLD}========== setvps v${VERSION} ==========${C_RESET}"
     printf '  1) 开启 Root SSH 密码登录并生成 14 位密码\n'
-    printf '  2) 配置 2G/4G Swap\n'
+    printf '  2) 配置 1G/2G/4G Swap\n'
     printf '  3) 管理每日定时重启\n'
     printf '  4) 检测 IP、设置协议优先级和出站源 IP\n'
     printf '  5) 查看当前状态\n'
@@ -849,7 +854,7 @@ setvps v${VERSION}
 用法：
   setvps                 打开交互式菜单
   setvps ssh             设置 Root SSH 密码登录
-  setvps swap 2|4        创建 2G 或 4G Swap
+  setvps swap 1|2|4      创建 1G、2G 或 4G Swap
   setvps reboot          管理每日重启时间
   setvps ip              管理 IP 出站策略
   setvps status          查看状态
@@ -881,7 +886,7 @@ case "${1:-}" in
     ;;
   swap)
     install_self
-    [[ -n "${2:-}" ]] || die "请指定 2 或 4，例如：setvps swap 2"
+    [[ -n "${2:-}" ]] || die "请指定 1、2 或 4，例如：setvps swap 1"
     configure_swap "$2"
     ;;
   reboot)
