@@ -3,13 +3,18 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.1.2"
+VERSION="0.2.0"
 INSTALL_PATH="/usr/local/sbin/setvps"
 COMMAND_LINK="/usr/local/bin/setvps"
 STATE_DIR="/etc/setvps"
 BACKUP_DIR="${STATE_DIR}/backups"
 REBOOT_HOURS_FILE="${STATE_DIR}/reboot-hours"
 IP_CONFIG_FILE="${STATE_DIR}/ip.conf"
+BBR_STATE_FILE="${STATE_DIR}/bbr.conf"
+BBR_SYSCTL_FILE="/etc/sysctl.d/99-zz-setvps-bbr.conf"
+BBR_MODULES_FILE="/etc/modules-load.d/setvps-bbr.conf"
+BBR_MANAGED_MARKER="# Managed by setvps BBR. Do not edit manually."
+BBR_MODULE_SYSFS_DIR="/sys/module/tcp_bbr"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-setvps.conf"
 APT_UPDATED=0
@@ -791,6 +796,556 @@ configure_ip_policy() {
   warn "glibc 地址优先级对多数程序生效；明确指定 -4/-6、自带 DNS 或代理网络栈的程序可能不遵循该优先级。"
 }
 
+get_sysctl_value() {
+  sysctl -n "$1" 2>/dev/null || true
+}
+
+bbr_algorithm_available() {
+  local algorithm="$1"
+  local available="${2:-}"
+  [[ -n "${available}" ]] || available="$(get_sysctl_value net.ipv4.tcp_available_congestion_control)"
+  case " ${available} " in
+    *" ${algorithm} "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+bbr_module_version() {
+  local version=""
+  if [[ -d "${BBR_MODULE_SYSFS_DIR}" ]]; then
+    if [[ -r "${BBR_MODULE_SYSFS_DIR}/version" ]]; then
+      version="$(awk 'NF {print $1; exit}' "${BBR_MODULE_SYSFS_DIR}/version" 2>/dev/null || true)"
+    fi
+  elif command -v modinfo >/dev/null 2>&1; then
+    version="$(modinfo -F version tcp_bbr 2>/dev/null | awk 'NF {print $1; exit}' || true)"
+  fi
+  printf '%s\n' "${version}"
+}
+
+bbr_module_installed() {
+  command -v modinfo >/dev/null 2>&1 && modinfo "$1" >/dev/null 2>&1
+}
+
+bbr_registered_version() {
+  local algorithm="$1"
+  local module_version
+  case "${algorithm}" in
+    bbr3) printf '3\n'; return ;;
+    bbr2) printf '2\n'; return ;;
+    bbr)
+      module_version="$(bbr_module_version)"
+      case "${module_version}" in
+        3|3.*) printf '3\n' ;;
+        2|2.*) printf '2\n' ;;
+        1|1.*) printf '1\n' ;;
+        *) printf 'unknown\n' ;;
+      esac
+      ;;
+    *) printf 'unknown\n' ;;
+  esac
+}
+
+bbr_label() {
+  local algorithm="$1"
+  local version
+  version="$(bbr_registered_version "${algorithm}")"
+  case "${version}" in
+    3) printf 'BBRv3（内核已明确提供）' ;;
+    2) printf 'BBRv2（内核已明确提供）' ;;
+    1) printf 'BBRv1（内核模块已标识）' ;;
+    *) printf '系统原生 BBR（标准接口未暴露版本，通常为主线 BBRv1）' ;;
+  esac
+}
+
+recommend_bbr_algorithm() {
+  local available
+  local version
+  available="$(get_sysctl_value net.ipv4.tcp_available_congestion_control)"
+  BBR_RECOMMENDED_ALGORITHM=""
+
+  version="$(bbr_registered_version bbr)"
+  if [[ "${version}" == "3" ]] && \
+     { bbr_algorithm_available bbr "${available}" || bbr_module_installed tcp_bbr; }; then
+    BBR_RECOMMENDED_ALGORITHM="bbr"
+    return 0
+  fi
+  if bbr_algorithm_available bbr3 "${available}" || bbr_module_installed tcp_bbr3; then
+    BBR_RECOMMENDED_ALGORITHM="bbr3"
+    return 0
+  fi
+  if bbr_algorithm_available bbr2 "${available}" || bbr_module_installed tcp_bbr2; then
+    BBR_RECOMMENDED_ALGORITHM="bbr2"
+    return 0
+  fi
+  if [[ "${version}" == "2" ]] && \
+     { bbr_algorithm_available bbr "${available}" || bbr_module_installed tcp_bbr; }; then
+    BBR_RECOMMENDED_ALGORITHM="bbr"
+    return 0
+  fi
+  if bbr_algorithm_available bbr "${available}" || bbr_module_installed tcp_bbr; then
+    BBR_RECOMMENDED_ALGORITHM="bbr"
+    return 0
+  fi
+  return 1
+}
+
+bbr_module_for_algorithm() {
+  case "$1" in
+    bbr3) printf 'tcp_bbr3\n' ;;
+    bbr2) printf 'tcp_bbr2\n' ;;
+    bbr) printf 'tcp_bbr\n' ;;
+    *) return 1 ;;
+  esac
+}
+
+load_bbr_candidate() {
+  local algorithm="$1"
+  local tcp_module
+  modprobe sch_fq >/dev/null 2>&1 || true
+  if bbr_algorithm_available "${algorithm}"; then
+    return 0
+  fi
+  tcp_module="$(bbr_module_for_algorithm "${algorithm}")"
+  modprobe "${tcp_module}" >/dev/null 2>&1
+}
+
+validate_bbr_managed_path() {
+  local path="$1"
+  [[ ! -L "${path}" ]] || die "拒绝使用符号链接路径：${path}"
+  if [[ -e "${path}" ]] && ! grep -Fqx "${BBR_MANAGED_MARKER}" "${path}" 2>/dev/null; then
+    die "${path} 已存在且不属于 setvps，请先人工处理，脚本不会覆盖。"
+  fi
+}
+
+remove_bbr_managed_file() {
+  local path="$1"
+  if [[ -L "${path}" ]]; then
+    warn "发现符号链接，未删除：${path}"
+    return 1
+  fi
+  [[ -e "${path}" ]] || return 0
+  if ! grep -Fqx "${BBR_MANAGED_MARKER}" "${path}" 2>/dev/null; then
+    warn "文件不属于 setvps，未删除：${path}"
+    return 1
+  fi
+  rm -f -- "${path}"
+}
+
+save_bbr_previous_state_once() {
+  local previous_cc="$1"
+  local previous_qdisc="$2"
+  local temp_state
+
+  [[ ! -L "${BBR_STATE_FILE}" ]] || die "拒绝使用符号链接状态文件：${BBR_STATE_FILE}"
+  if [[ -e "${BBR_STATE_FILE}" ]]; then
+    grep -Fqx "${BBR_MANAGED_MARKER}" "${BBR_STATE_FILE}" 2>/dev/null || \
+      die "BBR 状态文件格式异常：${BBR_STATE_FILE}"
+    return 0
+  fi
+
+  install -d -m 0700 "${STATE_DIR}"
+  temp_state="$(mktemp "${STATE_DIR}/.bbr.conf.XXXXXX")"
+  {
+    printf '%s\n' "${BBR_MANAGED_MARKER}"
+    printf 'STATE_VERSION=1\n'
+    printf 'PREVIOUS_CC=%s\n' "${previous_cc}"
+    printf 'PREVIOUS_QDISC=%s\n' "${previous_qdisc}"
+  } >"${temp_state}"
+  install -m 0600 "${temp_state}" "${BBR_STATE_FILE}"
+  rm -f -- "${temp_state}"
+}
+
+read_bbr_state_value() {
+  local key="$1"
+  [[ -r "${BBR_STATE_FILE}" && ! -L "${BBR_STATE_FILE}" ]] || return 0
+  awk -F= -v wanted="${key}" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' "${BBR_STATE_FILE}" 2>/dev/null || true
+}
+
+write_bbr_persistence() {
+  local algorithm="$1"
+  local transaction_dir="$2"
+  local tcp_module
+  local sysctl_temp="${transaction_dir}/new-sysctl.conf"
+  local modules_temp="${transaction_dir}/new-modules.conf"
+  local -a modules=()
+
+  tcp_module="$(bbr_module_for_algorithm "${algorithm}")"
+  install -d -m 0755 "$(dirname "${BBR_SYSCTL_FILE}")" "$(dirname "${BBR_MODULES_FILE}")" || return 1
+  {
+    printf '%s\n' "${BBR_MANAGED_MARKER}"
+    printf 'net.core.default_qdisc = fq\n'
+    printf 'net.ipv4.tcp_congestion_control = %s\n' "${algorithm}"
+  } >"${sysctl_temp}" || return 1
+  install -m 0644 "${sysctl_temp}" "${BBR_SYSCTL_FILE}" || return 1
+
+  command -v modinfo >/dev/null 2>&1 || return 0
+  modinfo sch_fq >/dev/null 2>&1 && modules+=(sch_fq)
+  modinfo "${tcp_module}" >/dev/null 2>&1 && modules+=("${tcp_module}")
+  if (( ${#modules[@]} == 0 )); then
+    remove_bbr_managed_file "${BBR_MODULES_FILE}"
+    return
+  fi
+
+  {
+    printf '%s\n' "${BBR_MANAGED_MARKER}"
+    printf '%s\n' "${modules[@]}"
+  } >"${modules_temp}" || return 1
+  install -m 0644 "${modules_temp}" "${BBR_MODULES_FILE}"
+}
+
+verify_bbr_runtime() {
+  local algorithm="$1"
+  local current_cc current_qdisc available
+  current_cc="$(get_sysctl_value net.ipv4.tcp_congestion_control)"
+  current_qdisc="$(get_sysctl_value net.core.default_qdisc)"
+  available="$(get_sysctl_value net.ipv4.tcp_available_congestion_control)"
+  [[ "${current_cc}" == "${algorithm}" ]] || return 1
+  [[ "${current_qdisc}" == "fq" ]] || return 1
+  bbr_algorithm_available "${algorithm}" "${available}" || return 1
+  grep -Fqx "${BBR_MANAGED_MARKER}" "${BBR_SYSCTL_FILE}" 2>/dev/null || return 1
+  grep -Fqx 'net.core.default_qdisc = fq' "${BBR_SYSCTL_FILE}" 2>/dev/null || return 1
+  grep -Fqx "net.ipv4.tcp_congestion_control = ${algorithm}" "${BBR_SYSCTL_FILE}" 2>/dev/null
+}
+
+rollback_bbr_enable() {
+  local previous_cc="$1"
+  local previous_qdisc="$2"
+  local transaction_dir="$3"
+  local had_sysctl="$4"
+  local had_modules="$5"
+  local created_state="$6"
+
+  sysctl -q -w "net.ipv4.tcp_congestion_control=${previous_cc}" >/dev/null 2>&1 || true
+  sysctl -q -w "net.core.default_qdisc=${previous_qdisc}" >/dev/null 2>&1 || true
+  if (( had_sysctl == 1 )); then
+    cp -a -- "${transaction_dir}/old-sysctl.conf" "${BBR_SYSCTL_FILE}" || true
+  else
+    remove_bbr_managed_file "${BBR_SYSCTL_FILE}" || true
+  fi
+  if (( had_modules == 1 )); then
+    cp -a -- "${transaction_dir}/old-modules.conf" "${BBR_MODULES_FILE}" || true
+  else
+    remove_bbr_managed_file "${BBR_MODULES_FILE}" || true
+  fi
+  (( created_state == 0 )) || rm -f -- "${BBR_STATE_FILE}"
+  rm -rf -- "${transaction_dir}"
+}
+
+enable_bbr() {
+  local requested="${1:-auto}"
+  local algorithm=""
+  local available module_version previous_cc previous_qdisc transaction_dir
+  local had_sysctl=0 had_modules=0 created_state=0
+
+  ensure_package sysctl procps
+  ensure_package modprobe kmod
+  available="$(get_sysctl_value net.ipv4.tcp_available_congestion_control)"
+  module_version="$(bbr_module_version)"
+
+  case "${requested}" in
+    auto)
+      if recommend_bbr_algorithm; then
+        algorithm="${BBR_RECOMMENDED_ALGORITHM}"
+      fi
+      ;;
+    v3)
+      if [[ "${module_version}" == "3" || "${module_version}" == 3.* ]] && \
+           { bbr_algorithm_available bbr "${available}" || bbr_module_installed tcp_bbr; }; then
+        algorithm="bbr"
+      elif bbr_algorithm_available bbr3 "${available}" || bbr_module_installed tcp_bbr3; then
+        algorithm="bbr3"
+      fi
+      ;;
+    v2)
+      if bbr_algorithm_available bbr2 "${available}" || bbr_module_installed tcp_bbr2; then
+        algorithm="bbr2"
+      elif [[ "${module_version}" == "2" || "${module_version}" == 2.* ]] && \
+           { bbr_algorithm_available bbr "${available}" || bbr_module_installed tcp_bbr; }; then
+        algorithm="bbr"
+      fi
+      ;;
+    native)
+      if bbr_algorithm_available bbr "${available}" || bbr_module_installed tcp_bbr; then
+        algorithm="bbr"
+      fi
+      ;;
+    *) warn "未知 BBR 模式：${requested}"; return 1 ;;
+  esac
+
+  if [[ -z "${algorithm}" ]]; then
+    if [[ "${requested}" == "v2" || "${requested}" == "v3" ]]; then
+      warn "当前运行内核没有可验证的 BBR${requested#v}，未做任何修改。"
+    else
+      warn "当前运行内核未提供 BBR。请先安装云厂商/发行版支持的兼容内核并重启。"
+    fi
+    warn "setvps 不会自动下载、编译或替换 AWS/GCP 的内核。"
+    return 1
+  fi
+
+  if ! load_bbr_candidate "${algorithm}"; then
+    warn "无法加载 ${algorithm} 对应的内核模块，未做任何修改。"
+    return 1
+  fi
+  available="$(get_sysctl_value net.ipv4.tcp_available_congestion_control)"
+  module_version="$(bbr_module_version)"
+  if ! bbr_algorithm_available "${algorithm}" "${available}"; then
+    warn "模块加载后仍未注册算法 ${algorithm}，未做任何修改。"
+    return 1
+  fi
+  if [[ "${requested}" == "v3" && "${algorithm}" == "bbr" ]] && \
+     [[ "${module_version}" != "3" && "${module_version}" != 3.* ]]; then
+    warn "tcp_bbr 未报告版本 3，拒绝按 BBRv3 启用。"
+    return 1
+  fi
+  if [[ "${requested}" == "v2" && "${algorithm}" == "bbr" ]] && \
+     [[ "${module_version}" != "2" && "${module_version}" != 2.* ]]; then
+    warn "tcp_bbr 未报告版本 2，拒绝按 BBRv2 启用。"
+    return 1
+  fi
+
+  previous_cc="$(get_sysctl_value net.ipv4.tcp_congestion_control)"
+  previous_qdisc="$(get_sysctl_value net.core.default_qdisc)"
+  [[ "${previous_cc}" =~ ^[a-zA-Z0-9_-]+$ ]] || { warn "无法读取当前 TCP 拥塞控制算法。"; return 1; }
+  [[ "${previous_qdisc}" =~ ^[a-zA-Z0-9_-]+$ ]] || { warn "无法读取当前默认 qdisc。"; return 1; }
+
+  validate_bbr_managed_path "${BBR_SYSCTL_FILE}"
+  validate_bbr_managed_path "${BBR_MODULES_FILE}"
+  transaction_dir="$(mktemp -d /tmp/setvps-bbr.XXXXXX)"
+  if [[ -e "${BBR_SYSCTL_FILE}" ]]; then
+    cp -a -- "${BBR_SYSCTL_FILE}" "${transaction_dir}/old-sysctl.conf"
+    had_sysctl=1
+  fi
+  if [[ -e "${BBR_MODULES_FILE}" ]]; then
+    cp -a -- "${BBR_MODULES_FILE}" "${transaction_dir}/old-modules.conf"
+    had_modules=1
+  fi
+  [[ -e "${BBR_STATE_FILE}" ]] || created_state=1
+  save_bbr_previous_state_once "${previous_cc}" "${previous_qdisc}"
+
+  log "启用 $(bbr_label "${algorithm}")，内核算法名：${algorithm}"
+  if ! sysctl -q -w net.core.default_qdisc=fq; then
+    rollback_bbr_enable "${previous_cc}" "${previous_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}" "${created_state}"
+    warn "无法设置默认 qdisc=fq，已恢复原设置。"
+    warn "当前内核可能仍能运行 BBR，但 setvps 只启用可同时验证 fq 的受支持配置。"
+    return 1
+  fi
+  if ! sysctl -q -w "net.ipv4.tcp_congestion_control=${algorithm}"; then
+    rollback_bbr_enable "${previous_cc}" "${previous_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}" "${created_state}"
+    warn "无法启用 ${algorithm}，已恢复原设置。"
+    return 1
+  fi
+  if ! write_bbr_persistence "${algorithm}" "${transaction_dir}"; then
+    rollback_bbr_enable "${previous_cc}" "${previous_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}" "${created_state}"
+    warn "写入 BBR 持久化配置失败，已恢复原设置。"
+    return 1
+  fi
+  if ! verify_bbr_runtime "${algorithm}"; then
+    rollback_bbr_enable "${previous_cc}" "${previous_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}" "${created_state}"
+    warn "BBR 验证失败，已恢复原设置。"
+    return 1
+  fi
+
+  rm -rf -- "${transaction_dir}"
+  ok "已启用并验证 $(bbr_label "${algorithm}")，已写入重启持久化配置。"
+  warn "拥塞控制算法只影响新建 TCP 连接；当前 SSH 连接不会中断，也不会立即切换。"
+  warn "fq 是系统默认 qdisc；多队列网卡的根队列仍可能显示 mq，这是正常现象。"
+}
+
+rollback_bbr_disable() {
+  local current_cc="$1"
+  local current_qdisc="$2"
+  local transaction_dir="$3"
+  local had_sysctl="$4"
+  local had_modules="$5"
+
+  sysctl -q -w "net.ipv4.tcp_congestion_control=${current_cc}" >/dev/null 2>&1 || true
+  sysctl -q -w "net.core.default_qdisc=${current_qdisc}" >/dev/null 2>&1 || true
+  if (( had_sysctl == 1 )); then
+    cp -a -- "${transaction_dir}/old-sysctl.conf" "${BBR_SYSCTL_FILE}" || true
+  fi
+  if (( had_modules == 1 )); then
+    cp -a -- "${transaction_dir}/old-modules.conf" "${BBR_MODULES_FILE}" || true
+  fi
+  rm -rf -- "${transaction_dir}"
+}
+
+disable_bbr() {
+  local previous_cc previous_qdisc available target_cc="" target_qdisc
+  local current_cc current_qdisc transaction_dir
+  local managed_state=0 had_sysctl=0 had_modules=0
+  ensure_package sysctl procps
+
+  if [[ -L "${BBR_STATE_FILE}" ]]; then
+    warn "BBR 状态文件是符号链接，拒绝修改：${BBR_STATE_FILE}"
+    return 1
+  elif [[ -e "${BBR_STATE_FILE}" ]]; then
+    if grep -Fqx "${BBR_MANAGED_MARKER}" "${BBR_STATE_FILE}" 2>/dev/null; then
+      managed_state=1
+    else
+      warn "BBR 状态文件不属于 setvps，拒绝修改。"
+      return 1
+    fi
+  fi
+  if [[ -L "${BBR_SYSCTL_FILE}" ]]; then
+    warn "BBR sysctl 文件是符号链接，拒绝修改：${BBR_SYSCTL_FILE}"
+    return 1
+  elif [[ -e "${BBR_SYSCTL_FILE}" ]]; then
+    if grep -Fqx "${BBR_MANAGED_MARKER}" "${BBR_SYSCTL_FILE}" 2>/dev/null; then
+      had_sysctl=1
+    else
+      warn "BBR sysctl 文件不属于 setvps，拒绝修改。"
+      return 1
+    fi
+  fi
+  if [[ -L "${BBR_MODULES_FILE}" ]]; then
+    warn "BBR 模块文件是符号链接，拒绝修改：${BBR_MODULES_FILE}"
+    return 1
+  elif [[ -e "${BBR_MODULES_FILE}" ]]; then
+    if grep -Fqx "${BBR_MANAGED_MARKER}" "${BBR_MODULES_FILE}" 2>/dev/null; then
+      had_modules=1
+    else
+      warn "BBR 模块文件不属于 setvps，拒绝修改。"
+      return 1
+    fi
+  fi
+  if (( managed_state == 0 && had_sysctl == 0 && had_modules == 0 )); then
+    warn "未发现由 setvps 管理的 BBR 配置，未修改当前拥塞控制算法。"
+    return 0
+  fi
+
+  previous_cc="$(read_bbr_state_value PREVIOUS_CC)"
+  previous_qdisc="$(read_bbr_state_value PREVIOUS_QDISC)"
+  current_cc="$(get_sysctl_value net.ipv4.tcp_congestion_control)"
+  current_qdisc="$(get_sysctl_value net.core.default_qdisc)"
+  available="$(get_sysctl_value net.ipv4.tcp_available_congestion_control)"
+  [[ "${current_cc}" =~ ^[a-zA-Z0-9_-]+$ ]] || { warn "无法读取当前 TCP 拥塞控制算法。"; return 1; }
+  [[ "${current_qdisc}" =~ ^[a-zA-Z0-9_-]+$ ]] || { warn "无法读取当前默认 qdisc。"; return 1; }
+  if [[ -n "${previous_cc}" ]] && [[ "${previous_cc}" =~ ^[a-zA-Z0-9_-]+$ ]] && \
+     bbr_algorithm_available "${previous_cc}" "${available}"; then
+    target_cc="${previous_cc}"
+  elif bbr_algorithm_available cubic "${available}"; then
+    target_cc="cubic"
+  elif bbr_algorithm_available reno "${available}"; then
+    target_cc="reno"
+  fi
+  [[ -n "${target_cc}" ]] || { warn "找不到可恢复的 TCP 拥塞控制算法。"; return 1; }
+  if [[ "${previous_qdisc}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    target_qdisc="${previous_qdisc}"
+  else
+    target_qdisc="${current_qdisc}"
+    warn "没有有效的原默认 qdisc 记录，将保持 ${current_qdisc}。"
+  fi
+
+  transaction_dir="$(mktemp -d /tmp/setvps-bbr-off.XXXXXX)"
+  (( had_sysctl == 0 )) || cp -a -- "${BBR_SYSCTL_FILE}" "${transaction_dir}/old-sysctl.conf"
+  (( had_modules == 0 )) || cp -a -- "${BBR_MODULES_FILE}" "${transaction_dir}/old-modules.conf"
+  if ! remove_bbr_managed_file "${BBR_SYSCTL_FILE}" || \
+     ! remove_bbr_managed_file "${BBR_MODULES_FILE}"; then
+    rollback_bbr_disable "${current_cc}" "${current_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}"
+    warn "无法删除 BBR 持久化文件，运行状态未更改。"
+    return 1
+  fi
+
+  if ! sysctl -q -w "net.ipv4.tcp_congestion_control=${target_cc}"; then
+    rollback_bbr_disable "${current_cc}" "${current_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}"
+    warn "恢复 TCP 拥塞控制算法失败，已回滚。"
+    return 1
+  fi
+  if ! sysctl -q -w "net.core.default_qdisc=${target_qdisc}"; then
+    rollback_bbr_disable "${current_cc}" "${current_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}"
+    warn "恢复默认 qdisc 失败，已回滚。"
+    return 1
+  fi
+  if [[ "$(get_sysctl_value net.ipv4.tcp_congestion_control)" != "${target_cc}" ]] || \
+     [[ "$(get_sysctl_value net.core.default_qdisc)" != "${target_qdisc}" ]] || \
+     [[ -e "${BBR_SYSCTL_FILE}" || -L "${BBR_SYSCTL_FILE}" || -e "${BBR_MODULES_FILE}" || -L "${BBR_MODULES_FILE}" ]]; then
+    rollback_bbr_disable "${current_cc}" "${current_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}"
+    warn "关闭后的运行状态或持久化验证失败，已回滚。"
+    return 1
+  fi
+  if (( managed_state == 1 )) && ! rm -f -- "${BBR_STATE_FILE}"; then
+    rollback_bbr_disable "${current_cc}" "${current_qdisc}" "${transaction_dir}" "${had_sysctl}" "${had_modules}"
+    warn "无法清理 BBR 状态文件，已回滚。"
+    return 1
+  fi
+
+  rm -rf -- "${transaction_dir}"
+  ok "已关闭 setvps 的 BBR 配置，新建 TCP 连接将使用 ${target_cc}。"
+  warn "脚本不会卸载内核模块；既有 TCP 连接保持原算法直至连接结束。"
+}
+
+show_bbr_status() {
+  local kernel current_cc current_qdisc available current_label="未启用 BBR"
+  local recommendation=""
+  local module_version
+  kernel="$(uname -r)"
+  current_cc="$(get_sysctl_value net.ipv4.tcp_congestion_control)"
+  current_qdisc="$(get_sysctl_value net.core.default_qdisc)"
+  available="$(get_sysctl_value net.ipv4.tcp_available_congestion_control)"
+  module_version="$(bbr_module_version)"
+
+  case "${current_cc}" in
+    bbr|bbr2|bbr3) current_label="$(bbr_label "${current_cc}")" ;;
+  esac
+  if recommend_bbr_algorithm; then
+    recommendation="$(bbr_label "${BBR_RECOMMENDED_ALGORITHM}")（算法名：${BBR_RECOMMENDED_ALGORITHM}）"
+  elif command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr3 >/dev/null 2>&1; then
+    recommendation="检测到未加载的 BBRv3 模块，可尝试自动启用"
+  elif [[ "${module_version}" == "3" || "${module_version}" == 3.* ]]; then
+    recommendation="检测到 tcp_bbr 模块版本 3，可尝试自动启用 BBRv3"
+  elif command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr2 >/dev/null 2>&1; then
+    recommendation="检测到未加载的 BBRv2 模块，可尝试自动启用"
+  elif command -v modinfo >/dev/null 2>&1 && modinfo tcp_bbr >/dev/null 2>&1; then
+    recommendation="检测到系统原生 BBR 模块，可尝试自动启用"
+  else
+    recommendation="当前内核未检测到 BBR；请使用发行版或云厂商支持的兼容内核"
+  fi
+
+  printf '内核：%s\n' "${kernel}"
+  printf '当前算法：%s（%s）\n' "${current_cc:-未知}" "${current_label}"
+  printf '可用算法：%s\n' "${available:-无法读取}"
+  printf 'tcp_bbr 模块版本：%s\n' "${module_version:-未暴露}"
+  printf '默认 qdisc：%s\n' "${current_qdisc:-无法读取}"
+  printf '自动选择：%s\n' "${recommendation}"
+  if [[ -e "${BBR_SYSCTL_FILE}" ]] && grep -Fqx "${BBR_MANAGED_MARKER}" "${BBR_SYSCTL_FILE}" 2>/dev/null; then
+    printf '重启持久化：已由 setvps 管理\n'
+  elif [[ -e "${BBR_SYSCTL_FILE}" ]]; then
+    printf '重启持久化：同名路径存在，但不属于 setvps\n'
+  else
+    printf '重启持久化：未由 setvps 管理\n'
+  fi
+  printf '版本判定：只有内核明确注册 bbr2/bbr3，或 tcp_bbr 模块报告版本 2/3 时才标记为 v2/v3。\n'
+}
+
+bbr_menu() {
+  local choice
+  while true; do
+    printf '\n%s\n' "${C_BOLD}========== BBR 管理 ==========${C_RESET}"
+    show_bbr_status
+    printf '\n  1) 自动启用当前内核最高可验证实现\n'
+    printf '  2) 启用 BBRv3（仅当前内核明确支持时）\n'
+    printf '  3) 启用 BBRv2（仅当前内核明确支持时）\n'
+    printf '  4) 启用当前内核注册的 bbr\n'
+    printf '  5) 关闭 setvps BBR 并恢复原设置\n'
+    printf '  0) 返回\n'
+    read -r -p '请选择：' choice
+    case "${choice}" in
+      1) enable_bbr auto || warn "BBR 未更改。"; pause ;;
+      2) enable_bbr v3 || warn "BBR 未更改。"; pause ;;
+      3) enable_bbr v2 || warn "BBR 未更改。"; pause ;;
+      4) enable_bbr native || warn "BBR 未更改。"; pause ;;
+      5)
+        if confirm "确认关闭 setvps BBR 并恢复原设置？"; then
+          disable_bbr || warn "BBR 恢复未完全成功。"
+          pause
+        fi
+        ;;
+      0|'') return ;;
+      *) warn "无效选项。" ;;
+    esac
+  done
+}
+
 show_status() {
   printf '\n%s setvps v%s%s\n' "${C_BOLD}" "${VERSION}" "${C_RESET}"
   printf '系统：'
@@ -822,6 +1377,9 @@ show_status() {
   printf '固定 IPv4 源地址：%s\n' "${IPV4_SOURCE:-自动}"
   printf '固定 IPv6 源地址：%s\n' "${IPV6_SOURCE:-自动}"
   show_detected_ips
+
+  printf '\nBBR：\n'
+  show_bbr_status
 }
 
 main_menu() {
@@ -831,7 +1389,8 @@ main_menu() {
     printf '  2) 配置 1G/2G/4G Swap\n'
     printf '  3) 管理每日定时重启\n'
     printf '  4) 检测 IP、设置协议优先级和出站源 IP\n'
-    printf '  5) 查看当前状态\n'
+    printf '  5) 管理 BBR 拥塞控制（自动选择 v3/v2/系统原生）\n'
+    printf '  6) 查看当前状态\n'
     printf '  0) 退出\n'
     local choice
     read -r -p '请选择：' choice
@@ -840,7 +1399,8 @@ main_menu() {
       2) swap_menu; pause ;;
       3) reboot_menu ;;
       4) configure_ip_policy; pause ;;
-      5) show_status; pause ;;
+      5) bbr_menu ;;
+      6) show_status; pause ;;
       0) exit 0 ;;
       *) warn "无效选项。" ;;
     esac
@@ -857,58 +1417,79 @@ setvps v${VERSION}
   setvps swap 1|2|4      创建 1G、2G 或 4G Swap
   setvps reboot          管理每日重启时间
   setvps ip              管理 IP 出站策略
+  setvps bbr             管理 BBR
+  setvps bbr auto        自动启用内核支持的最高可验证版本
+  setvps bbr v3|v2       仅在内核明确支持时启用指定版本
+  setvps bbr native      启用当前内核注册的 bbr
+  setvps bbr status|off  查看状态或关闭并恢复原设置
   setvps status          查看状态
   setvps --install       安装/更新 setvps 命令
 EOF
 }
 
-require_root
-check_supported_os
+main() {
+  require_root
+  check_supported_os
 
-case "${1:-}" in
-  --apply-ip-policy) apply_ip_policy; exit 0 ;;
-  --clear-ip-policy) clear_ip_policy; exit 0 ;;
-esac
+  case "${1:-}" in
+    --apply-ip-policy) apply_ip_policy; exit 0 ;;
+    --clear-ip-policy) clear_ip_policy; exit 0 ;;
+  esac
 
-if command -v flock >/dev/null 2>&1; then
-  exec 9>/run/setvps.lock
-  flock -n 9 || die "另一个 setvps 进程正在运行。"
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>/run/setvps.lock
+    flock -n 9 || die "另一个 setvps 进程正在运行。"
+  fi
+
+  case "${1:-}" in
+    --install)
+      install_self
+      exit 0
+      ;;
+    ssh)
+      install_self
+      enable_root_password_ssh
+      ;;
+    swap)
+      install_self
+      [[ -n "${2:-}" ]] || die "请指定 1、2 或 4，例如：setvps swap 1"
+      configure_swap "$2"
+      ;;
+    reboot)
+      install_self
+      reboot_menu
+      ;;
+    ip)
+      install_self
+      configure_ip_policy
+      ;;
+    bbr)
+      install_self
+      case "${2:-}" in
+        '') bbr_menu ;;
+        auto|v2|v3|native) enable_bbr "$2" ;;
+        status) show_bbr_status ;;
+        off) disable_bbr ;;
+        *) die "用法：setvps bbr auto|v3|v2|native|status|off" ;;
+      esac
+      ;;
+    status)
+      show_status
+      ;;
+    -h|--help)
+      usage
+      ;;
+    '')
+      install_self
+      main_menu
+      ;;
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
 fi
-
-case "${1:-}" in
-  --install)
-    install_self
-    exit 0
-    ;;
-  ssh)
-    install_self
-    enable_root_password_ssh
-    ;;
-  swap)
-    install_self
-    [[ -n "${2:-}" ]] || die "请指定 1、2 或 4，例如：setvps swap 1"
-    configure_swap "$2"
-    ;;
-  reboot)
-    install_self
-    reboot_menu
-    ;;
-  ip)
-    install_self
-    configure_ip_policy
-    ;;
-  status)
-    show_status
-    ;;
-  -h|--help)
-    usage
-    ;;
-  '')
-    install_self
-    main_menu
-    ;;
-  *)
-    usage
-    exit 1
-    ;;
-esac

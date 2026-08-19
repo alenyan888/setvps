@@ -19,4 +19,6 @@ jobs:
           bash -n setvps.sh
           shellcheck -x setvps.sh tests/test-static.sh
       - name: Run static contract tests
-        run: bash tests/test-static.sh
+        run: |
+          bash tests/test-static.sh
+          bash tests/test-bbr.sh
