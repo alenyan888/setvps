@@ -23,6 +23,11 @@ assert_contains 'IP_MODE="prefer6"'
 assert_contains 'table inet setvps_family'
 assert_contains 'set_default_route_source 4'
 assert_contains 'set_default_route_source 6'
+assert_contains 'show_public_ip_detection'
+assert_contains 'https://api64.ipify.org'
+assert_contains 'https://icanhazip.com'
+assert_contains 'https://ifconfig.co/ip'
+assert_contains '不直接判定 IPv6 不可用'
 
 password_body="$(sed -n '/^generate_password()/,/^}/p' "${SCRIPT}")"
 grep -Fq 'i < 14' <<<"${password_body}" || {
