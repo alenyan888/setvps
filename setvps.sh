@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 
-VERSION="0.1.0"
+VERSION="0.1.1"
 INSTALL_PATH="/usr/local/sbin/setvps"
 COMMAND_LINK="/usr/local/bin/setvps"
 STATE_DIR="/etc/setvps"
@@ -13,6 +13,13 @@ IP_CONFIG_FILE="${STATE_DIR}/ip.conf"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 SSHD_DROPIN="/etc/ssh/sshd_config.d/00-setvps.conf"
 APT_UPDATED=0
+IP_DETECT_CONNECT_TIMEOUT=6
+IP_DETECT_MAX_TIME=12
+PUBLIC_IP_ENDPOINTS=(
+  'https://api64.ipify.org'
+  'https://icanhazip.com'
+  'https://ifconfig.co/ip'
+)
 
 if [[ -t 1 ]]; then
   C_RED=$'\033[31m'
@@ -611,19 +618,89 @@ mode_label() {
   esac
 }
 
+valid_ipv4_address() {
+  local value="$1"
+  local octet
+  local -a octets=()
+  IFS='.' read -r -a octets <<<"${value}"
+  ((${#octets[@]} == 4)) || return 1
+  for octet in "${octets[@]}"; do
+    [[ "${octet}" =~ ^[0-9]{1,3}$ ]] || return 1
+    ((10#${octet} <= 255)) || return 1
+  done
+}
+
+valid_ipv6_address() {
+  local value="$1"
+  [[ "${value}" == *:* && "${value}" =~ ^[0-9A-Fa-f:.]+$ ]]
+}
+
+detect_public_ip() {
+  local family="$1"
+  local endpoint result provider
+  for endpoint in "${PUBLIC_IP_ENDPOINTS[@]}"; do
+    if result="$(curl "-${family}" -fsS \
+      --connect-timeout "${IP_DETECT_CONNECT_TIMEOUT}" \
+      --max-time "${IP_DETECT_MAX_TIME}" \
+      --header 'Accept: text/plain' \
+      "${endpoint}" 2>/dev/null)"; then
+      result="${result//[[:space:]]/}"
+      if { [[ "${family}" == "4" ]] && valid_ipv4_address "${result}"; } || \
+         { [[ "${family}" == "6" ]] && valid_ipv6_address "${result}"; }; then
+        provider="${endpoint#*://}"
+        provider="${provider%%/*}"
+        printf '%s|%s\n' "${result}" "${provider}"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+show_public_ip_detection() {
+  printf '\n%s\n' "${C_BOLD}公网 HTTPS 连通性（多节点检测）${C_RESET}"
+  if ! command -v curl >/dev/null 2>&1; then
+    printf '未检测：系统没有安装 curl。\n'
+    return
+  fi
+
+  local temp4 temp6 pid4 pid6 result4 result6 public_ip provider
+  temp4="$(mktemp)"
+  temp6="$(mktemp)"
+  detect_public_ip 4 >"${temp4}" 2>/dev/null &
+  pid4=$!
+  detect_public_ip 6 >"${temp6}" 2>/dev/null &
+  pid6=$!
+  wait "${pid4}" || true
+  wait "${pid6}" || true
+  result4="$(head -n1 "${temp4}")"
+  result6="$(head -n1 "${temp6}")"
+  rm -f "${temp4}" "${temp6}"
+
+  if [[ -n "${result4}" ]]; then
+    public_ip="${result4%%|*}"
+    provider="${result4#*|}"
+    printf 'IPv4：%s（检测节点：%s）\n' "${public_ip}" "${provider}"
+  else
+    printf 'IPv4：未确认（已尝试 %d 个节点；不直接判定 IPv4 不可用）\n' "${#PUBLIC_IP_ENDPOINTS[@]}"
+  fi
+  if [[ -n "${result6}" ]]; then
+    public_ip="${result6%%|*}"
+    provider="${result6#*|}"
+    printf 'IPv6：%s（检测节点：%s）\n' "${public_ip}" "${provider}"
+  else
+    printf 'IPv6：未确认（已尝试 %d 个节点；不直接判定 IPv6 不可用）\n' "${#PUBLIC_IP_ENDPOINTS[@]}"
+  fi
+}
+
 show_detected_ips() {
   printf '\n%s\n' "${C_BOLD}网卡全局地址${C_RESET}"
   ip -o -4 addr show scope global | awk '{print "IPv4  " $2 "  " $4}' || true
   ip -o -6 addr show scope global | awk '{print "IPv6  " $2 "  " $4}' || true
   printf '\n%s\n' "${C_BOLD}当前默认路由选择${C_RESET}"
-  ip -4 route get 1.1.1.1 2>/dev/null || printf 'IPv4：不可用\n'
-  ip -6 route get 2606:4700:4700::1111 2>/dev/null || printf 'IPv6：不可用\n'
-  if command -v curl >/dev/null 2>&1; then
-    local public4 public6
-    public4="$(curl -4fsS --connect-timeout 3 --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
-    public6="$(curl -6fsS --connect-timeout 3 --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
-    printf '\n公网检测：IPv4=%s  IPv6=%s\n' "${public4:-不可用}" "${public6:-不可用}"
-  fi
+  ip -4 route get 1.1.1.1 2>/dev/null || printf 'IPv4：未找到可用路由\n'
+  ip -6 route get 2606:4700:4700::1111 2>/dev/null || printf 'IPv6：未找到可用路由\n'
+  show_public_ip_detection
 }
 
 choose_source_address() {
